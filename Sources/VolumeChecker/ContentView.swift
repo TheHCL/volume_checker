@@ -115,6 +115,15 @@ struct LevelPanel: View {
                     StatView(title: "超過門檻時間", text: String(format: "%.1f%%", monitor.percentOverThreshold))
                     StatView(title: "吵雜事件", text: "\(monitor.events.count) 次")
                 }
+                if monitor.isRunning {
+                    Text(String(
+                        format: "原始訊號 %.1f dBFS・已收到 %d 個音訊區塊・%@",
+                        monitor.rawDBFS, monitor.buffersReceived, monitor.selectedDeviceName
+                    ))
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                }
             }
         }
         .padding(16)

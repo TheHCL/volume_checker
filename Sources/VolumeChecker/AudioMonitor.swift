@@ -1,7 +1,6 @@
-import Accelerate
 import AppKit
-import AudioToolbox
 import AVFoundation
+import CoreMedia
 import Combine
 import UserNotifications
 
@@ -40,6 +39,9 @@ final class AudioMonitor: ObservableObject {
     @Published private(set) var isNoisy = false
     @Published private(set) var startedAt: Date?
     @Published var errorMessage: String?
+    /// 未校正的原始音量（dBFS）與收到的音訊區塊數，用來確認麥克風真的有資料進來。
+    @Published private(set) var rawDBFS = -120.0
+    @Published private(set) var buffersReceived = 0
 
     private(set) var sessionMax = 0.0
     private var sessionEnergy = 0.0
@@ -99,8 +101,15 @@ final class AudioMonitor: ObservableObject {
     }
 
     private let defaults = UserDefaults.standard
-    private var engine: AVAudioEngine?
-    private var configObserver: NSObjectProtocol?
+    private let captureQueue = DispatchQueue(label: "VolumeChecker.capture")
+    private var session: AVCaptureSession?
+    private var receiver: AudioSampleReceiver?
+    private var runtimeErrorObserver: NSObjectProtocol?
+    private var watchdog: Timer?
+    private var runStartedAt: Date?
+    private var lastBufferAt: Date?
+    private var lastAudibleAt: Date?
+    private var diagnosticMessage: String?
     private var activity: NSObjectProtocol?
 
     private let historyBinSeconds = 0.5
@@ -222,7 +231,7 @@ final class AudioMonitor: ObservableObject {
         }
     }
 
-    // MARK: - 音訊引擎
+    // MARK: - 音訊擷取
 
     private func restart() {
         guard wantsRunning else { return }
@@ -233,90 +242,123 @@ final class AudioMonitor: ObservableObject {
     private func startEngine() {
         stopEngine()
 
-        var deviceID: AudioDeviceID?
-        if !selectedDeviceUID.isEmpty {
-            guard let device = devices.first(where: { $0.uid == selectedDeviceUID }) else {
-                errorMessage = "找不到選擇的麥克風，請確認外接麥克風已連接（重新插上後會自動恢復監控）。"
-                return
-            }
-            deviceID = device.id
+        let device: AVCaptureDevice?
+        if selectedDeviceUID.isEmpty {
+            device = AVCaptureDevice.default(for: .audio)
+        } else {
+            // CoreAudio 的裝置 UID 就是 AVCaptureDevice 的 uniqueID。
+            device = AVCaptureDevice(uniqueID: selectedDeviceUID)
         }
-
-        let engine = AVAudioEngine()
-        let input = engine.inputNode
-
-        if let deviceID, let unit = input.audioUnit {
-            var id = deviceID
-            let status = AudioUnitSetProperty(
-                unit,
-                kAudioOutputUnitProperty_CurrentDevice,
-                kAudioUnitScope_Global,
-                0,
-                &id,
-                UInt32(MemoryLayout<AudioDeviceID>.size)
-            )
-            if status != noErr {
-                errorMessage = "無法切換到選擇的麥克風（錯誤碼 \(status)）。"
-                return
-            }
-        }
-
-        let format = input.outputFormat(forBus: 0)
-        guard format.channelCount > 0, format.sampleRate > 0 else {
-            errorMessage = "這個裝置沒有可用的輸入聲道。"
+        guard let device else {
+            errorMessage = selectedDeviceUID.isEmpty
+                ? "找不到任何麥克風。"
+                : "找不到選擇的麥克風，請確認外接麥克風已連接（重新插上後會自動恢復監控）。"
             return
         }
 
-        // 約 0.1 秒一個區塊，接近聲級計的「Fast」時間加權。
-        let bufferSize = AVAudioFrameCount(max(1024, format.sampleRate / 10))
-        input.installTap(onBus: 0, bufferSize: bufferSize, format: format) { [weak self] buffer, _ in
-            guard let dbfs = AudioMonitor.dbfs(of: buffer) else { return }
+        let session = AVCaptureSession()
+        do {
+            let input = try AVCaptureDeviceInput(device: device)
+            guard session.canAddInput(input) else {
+                errorMessage = "無法使用「\(device.localizedName)」作為輸入。"
+                return
+            }
+            session.addInput(input)
+        } catch {
+            errorMessage = "無法開啟「\(device.localizedName)」：\(error.localizedDescription)"
+            return
+        }
+
+        let output = AVCaptureAudioDataOutput()
+        let receiver = AudioSampleReceiver { [weak self] dbfs in
             DispatchQueue.main.async {
                 self?.process(dbfs: dbfs, at: Date())
             }
         }
-
-        do {
-            engine.prepare()
-            try engine.start()
-        } catch {
-            input.removeTap(onBus: 0)
-            errorMessage = "無法啟動麥克風：\(error.localizedDescription)"
+        output.setSampleBufferDelegate(receiver, queue: captureQueue)
+        guard session.canAddOutput(output) else {
+            errorMessage = "無法建立音訊輸出。"
             return
         }
+        session.addOutput(output)
 
-        self.engine = engine
-        configObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: engine,
+        runtimeErrorObserver = NotificationCenter.default.addObserver(
+            forName: .AVCaptureSessionRuntimeError,
+            object: session,
             queue: .main
-        ) { [weak self] _ in
-            // 取樣率或裝置改變時重新建立引擎。
+        ) { [weak self] note in
+            let error = note.userInfo?[AVCaptureSessionErrorKey] as? Error
+            self?.errorMessage = "麥克風發生錯誤：\(error?.localizedDescription ?? "未知錯誤")，正在重新啟動…"
             self?.restart()
+        }
+
+        self.session = session
+        self.receiver = receiver
+        captureQueue.async {
+            session.startRunning()
         }
 
         isRunning = true
         if startedAt == nil { startedAt = Date() }
-        binStart = Date()
+        let now = Date()
+        binStart = now
+        runStartedAt = now
+        lastBufferAt = nil
+        lastAudibleAt = nil
+        buffersReceived = 0
+        startWatchdog()
         beginActivity()
     }
 
     private func stopEngine() {
-        if let configObserver {
-            NotificationCenter.default.removeObserver(configObserver)
+        if let runtimeErrorObserver {
+            NotificationCenter.default.removeObserver(runtimeErrorObserver)
         }
-        configObserver = nil
-        if let engine {
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
+        runtimeErrorObserver = nil
+        watchdog?.invalidate()
+        watchdog = nil
+        if let session {
+            captureQueue.async {
+                session.stopRunning()
+            }
         }
-        engine = nil
+        session = nil
+        receiver = nil
         endActivity()
         if loggingEnabled { logger.flush() }
         finishActiveEvent()
         overStart = nil
         lastAbove = nil
         if isRunning { isRunning = false }
+    }
+
+    /// 檢查是否真的有收到聲音，沒有的話在畫面上說明原因。
+    private func startWatchdog() {
+        watchdog = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.checkSignal()
+        }
+    }
+
+    private func checkSignal() {
+        guard isRunning, let runStartedAt else { return }
+        let now = Date()
+        let noBuffers = now.timeIntervalSince(lastBufferAt ?? runStartedAt) > 3
+        let silent = now.timeIntervalSince(lastAudibleAt ?? runStartedAt) > 5
+
+        if noBuffers {
+            setDiagnostic("沒有收到「\(selectedDeviceName)」的音訊資料。請確認麥克風有接好，或換一個輸入裝置試試。")
+        } else if silent {
+            setDiagnostic("收到的訊號完全是靜音。可能是麥克風權限被拒（macOS 會給靜音資料）、麥克風被靜音或輸入音量為 0。請到「系統設定 › 聲音 › 輸入」確認音量，或到「隱私權與安全性 › 麥克風」允許 VolumeChecker。")
+        } else if errorMessage == diagnosticMessage {
+            setDiagnostic(nil)
+        }
+    }
+
+    private func setDiagnostic(_ message: String?) {
+        if errorMessage == nil || errorMessage == diagnosticMessage {
+            errorMessage = message
+        }
+        diagnosticMessage = message
     }
 
     private func permissionDenied() {
@@ -336,6 +378,9 @@ final class AudioMonitor: ObservableObject {
             errorMessage = "外接麥克風已中斷連線，重新插上後會自動恢復監控。"
         } else if wantsRunning && !isRunning && selectedPresent {
             startEngine()
+        } else if isRunning && selectedDeviceUID.isEmpty {
+            // 系統預設輸入裝置可能換了，重新開啟以跟上。
+            restart()
         }
     }
 
@@ -354,25 +399,12 @@ final class AudioMonitor: ObservableObject {
 
     // MARK: - 音量計算
 
-    /// 回傳緩衝區所有聲道平均的 RMS 音量（dBFS，0 為數位滿刻度）。
-    private static func dbfs(of buffer: AVAudioPCMBuffer) -> Double? {
-        guard let data = buffer.floatChannelData else { return nil }
-        let frames = vDSP_Length(buffer.frameLength)
-        let channels = Int(buffer.format.channelCount)
-        guard frames > 0, channels > 0 else { return nil }
-
-        var total: Float = 0
-        for channel in 0..<channels {
-            var meanSquare: Float = 0
-            vDSP_measqv(data[channel], 1, &meanSquare, frames)
-            total += meanSquare
-        }
-        let meanSquare = Double(total) / Double(channels)
-        return 10 * log10(max(meanSquare, 1e-12))
-    }
-
     private func process(dbfs: Double, at now: Date) {
         guard isRunning else { return }
+        buffersReceived += 1
+        lastBufferAt = now
+        rawDBFS = dbfs
+        if dbfs > -100 { lastAudibleAt = now }
         let db = max(0, dbfs + calibrationOffset)
         let energy = pow(10, db / 10)
 
@@ -447,5 +479,31 @@ final class AudioMonitor: ObservableObject {
         )
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
+    }
+}
+
+/// 接收 AVCaptureSession 的音訊區塊，回報所有聲道平均的音量（dBFS，0 為數位滿刻度）。
+final class AudioSampleReceiver: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+    private let onLevel: (Double) -> Void
+
+    init(onLevel: @escaping (Double) -> Void) {
+        self.onLevel = onLevel
+    }
+
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        let channels = connection.audioChannels
+        guard !channels.isEmpty else { return }
+        // averagePowerLevel 是每個聲道這個區塊的平均功率（dB）；換回能量平均再轉 dB。
+        var energy = 0.0
+        for channel in channels {
+            let power = Double(channel.averagePowerLevel)
+            if power.isFinite { energy += pow(10, power / 10) }
+        }
+        energy /= Double(channels.count)
+        onLevel(10 * log10(max(energy, 1e-12)))
     }
 }
