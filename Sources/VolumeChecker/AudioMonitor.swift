@@ -181,6 +181,11 @@ final class AudioMonitor: ObservableObject {
     }
 
     func start() {
+        if !wantsRunning {
+            // 使用者重新按「開始監控」：清掉上一次的數值，從頭開始統計。
+            // （麥克風重新連線等內部重啟不會走到這裡，統計會延續。）
+            startNewSession()
+        }
         wantsRunning = true
         errorMessage = nil
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
@@ -217,8 +222,22 @@ final class AudioMonitor: ObservableObject {
         sessionSamples = 0
         sessionOverSamples = 0
         history.removeAll()
+        binStart = Date()
+        binEnergy = 0
+        binSamples = 0
         startedAt = isRunning ? Date() : nil
         objectWillChange.send()
+    }
+
+    private func startNewSession() {
+        resetStatistics()
+        events.removeAll()
+        currentDB = 0
+        rawDBFS = -120
+        buffersReceived = 0
+        isNoisy = false
+        lastAlert = nil
+        errorMessage = nil
     }
 
     func openLogFolder() {
