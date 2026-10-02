@@ -13,6 +13,7 @@ final class LevelLogger {
     private var sampleCount = 0
     private var minDB = Double.infinity
     private var maxDB = -Double.infinity
+    private var soundCounts: [String: Int] = [:]
 
     private let timestampFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -49,17 +50,24 @@ final class LevelLogger {
         maxDB = max(maxDB, db)
     }
 
+    /// 記錄這一分鐘辨識到的聲音（寫檔時取最常出現的）。
+    func addSound(_ identifier: String) {
+        guard minuteStart != nil else { return }
+        soundCounts[identifier, default: 0] += 1
+    }
+
     /// 把目前累積的這一分鐘寫入檔案（停止監控時也會呼叫）。
     func flush() {
         defer { resetMinute() }
         guard let start = minuteStart, sampleCount > 0 else { return }
         let leq = 10 * log10(energySum / Double(sampleCount))
+        let sound = soundCounts.max { $0.value < $1.value }.map { SoundLabels.name(for: $0.key) } ?? ""
         let line = String(
-            format: "%@,%.1f,%.1f,%.1f\n",
-            timestampFormatter.string(from: start), leq, minDB, maxDB
+            format: "%@,%.1f,%.1f,%.1f,%@\n",
+            timestampFormatter.string(from: start), leq, minDB, maxDB, Self.csvField(sound)
         )
         let file = directory.appendingPathComponent("levels-\(dayFormatter.string(from: start)).csv")
-        append(line, to: file, header: "時間,平均音量Leq(dB),最小(dB),最大(dB)\n")
+        append(line, to: file, header: "時間,平均音量Leq(dB),最小(dB),最大(dB),主要聲音\n")
     }
 
     func log(event: NoiseEvent) {
@@ -76,17 +84,24 @@ final class LevelLogger {
         try text.write(to: url, atomically: true, encoding: .utf8)
     }
 
-    static let eventsHeader = "開始時間,結束時間,持續秒數,最大音量(dB),平均音量Leq(dB)\n"
+    static let eventsHeader = "開始時間,結束時間,持續秒數,最大音量(dB),平均音量Leq(dB),主要聲音\n"
 
     private static func csvRow(for event: NoiseEvent, formatter: DateFormatter) -> String {
         String(
-            format: "%@,%@,%.0f,%.1f,%.1f\n",
+            format: "%@,%@,%.0f,%.1f,%.1f,%@\n",
             formatter.string(from: event.start),
             formatter.string(from: event.end),
             event.duration,
             event.peak,
-            event.leq
+            event.leq,
+            csvField(event.dominantSound ?? "")
         )
+    }
+
+    private static func csvField(_ text: String) -> String {
+        text.contains(",") || text.contains("\"")
+            ? "\"" + text.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+            : text
     }
 
     private func resetMinute() {
@@ -95,10 +110,19 @@ final class LevelLogger {
         sampleCount = 0
         minDB = .infinity
         maxDB = -.infinity
+        soundCounts = [:]
     }
 
     private func append(_ line: String, to file: URL, header: String) {
         let fm = FileManager.default
+        // 舊版檔案的欄位不同：改名保留，另開新檔。
+        if fm.fileExists(atPath: file.path),
+           let existing = try? String(contentsOf: file, encoding: .utf8),
+           let firstLine = existing.split(separator: "\n", maxSplits: 1).first,
+           firstLine.trimmingCharacters(in: CharacterSet(charactersIn: "\u{FEFF}\r")) != header.trimmingCharacters(in: .newlines) {
+            let old = file.deletingPathExtension().lastPathComponent + "-舊格式-\(Int(Date().timeIntervalSince1970)).csv"
+            try? fm.moveItem(at: file, to: file.deletingLastPathComponent().appendingPathComponent(old))
+        }
         if !fm.fileExists(atPath: file.path) {
             fm.createFile(atPath: file.path, contents: Data(("\u{FEFF}" + header).utf8))
         }

@@ -32,7 +32,7 @@ struct ContentView: View {
             }
         }
         .padding(20)
-        .frame(minWidth: 820, minHeight: 720)
+        .frame(minWidth: 900, minHeight: 740)
     }
 
     private var header: some View {
@@ -106,6 +106,11 @@ struct LevelPanel: View {
             }
             .frame(width: 180, alignment: .leading)
 
+            if monitor.classificationEnabled {
+                SoundGuessView()
+                    .frame(width: 170, alignment: .leading)
+            }
+
             VStack(alignment: .leading, spacing: 12) {
                 LevelBar(value: monitor.isRunning ? monitor.currentDB : displayRange.lowerBound,
                          threshold: monitor.threshold)
@@ -114,6 +119,13 @@ struct LevelPanel: View {
                     StatView(title: "最大", value: monitor.sessionMax)
                     StatView(title: "超過門檻時間", text: String(format: "%.1f%%", monitor.percentOverThreshold))
                     StatView(title: "吵雜事件", text: "\(monitor.events.count) 次")
+                }
+                if !monitor.topSounds.isEmpty {
+                    Text("本次主要聲音：" + monitor.topSounds
+                        .map { String(format: "%@ %.0f%%", $0.name, $0.percent) }
+                        .joined(separator: "、"))
+                        .font(.callout)
+                        .lineLimit(1)
                 }
                 if monitor.isRunning {
                     Text(String(
@@ -136,6 +148,37 @@ struct LevelPanel: View {
         if monitor.currentDB >= monitor.threshold { return "dB・偏吵" }
         if monitor.currentDB >= monitor.threshold - 10 { return "dB・稍有聲響" }
         return "dB・安靜"
+    }
+}
+
+/// 顯示目前最可能的聲音類型與信心度。
+struct SoundGuessView: View {
+    @EnvironmentObject private var monitor: AudioMonitor
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("可能是").font(.caption).foregroundStyle(.secondary)
+            if let top = monitor.soundGuesses.first {
+                Text(top.name)
+                    .font(.title2.weight(.semibold))
+                    .lineLimit(1)
+                ForEach(monitor.soundGuesses.dropFirst(), id: \.identifier) { guess in
+                    Text(String(format: "%@ %.0f%%", guess.name, guess.confidence * 100))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                ProgressView(value: top.confidence)
+                    .tint(.blue)
+                Text(String(format: "信心度 %.0f%%", top.confidence * 100))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text(monitor.isRunning ? "辨識中…" : "--")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 }
 
@@ -270,6 +313,11 @@ struct EventList: View {
                     Text(event.start.formatted(date: .abbreviated, time: .standard))
                         .monospacedDigit()
                     Spacer()
+                    if let sound = event.dominantSound {
+                        Text(sound)
+                            .lineLimit(1)
+                            .foregroundStyle(.secondary)
+                    }
                     Text(event.isOngoing ? "進行中" : formatDuration(event.duration))
                         .foregroundStyle(.secondary)
                         .frame(width: 80, alignment: .trailing)
@@ -332,6 +380,16 @@ struct SettingsPanel: View {
                     .disabled(!AudioMonitor.canUseNotifications)
                     .help(AudioMonitor.canUseNotifications ? "" : "需要以 .app 方式執行才能發送通知（請使用 scripts/build_app.sh）")
                 Toggle("播放提示音", isOn: $monitor.soundEnabled)
+            }
+
+            Section {
+                Toggle("辨識聲音類型", isOn: $monitor.classificationEnabled)
+            } header: {
+                Text("聲音辨識")
+            } footer: {
+                Text("使用 macOS 內建的聲音分類模型，在本機辨識約 300 種聲音（車輛、喇叭、警笛、說話、狗叫…），不需網路。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section {

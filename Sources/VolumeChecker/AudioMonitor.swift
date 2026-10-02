@@ -19,6 +19,12 @@ struct NoiseEvent: Identifiable {
     var energySum: Double
     var sampleCount: Int
     var isOngoing = true
+    /// 事件期間辨識到的聲音類型次數。
+    var soundCounts: [String: Int] = [:]
+
+    var dominantSound: String? {
+        soundCounts.max { $0.value < $1.value }.map { SoundLabels.name(for: $0.key) }
+    }
 
     var duration: TimeInterval { end.timeIntervalSince(start) }
     var leq: Double { sampleCount > 0 ? 10 * log10(energySum / Double(sampleCount)) : peak }
@@ -42,6 +48,10 @@ final class AudioMonitor: ObservableObject {
     /// 未校正的原始音量（dBFS）與收到的音訊區塊數，用來確認麥克風真的有資料進來。
     @Published private(set) var rawDBFS = -120.0
     @Published private(set) var buffersReceived = 0
+    /// 最新一次聲音辨識結果（最多 3 個可能）。
+    @Published private(set) var soundGuesses: [SoundGuess] = []
+    /// 本次監控中各種聲音被辨識到的次數（不含安靜）。
+    @Published private(set) var soundStats: [String: Int] = [:]
 
     private(set) var sessionMax = 0.0
     private var sessionEnergy = 0.0
@@ -78,6 +88,13 @@ final class AudioMonitor: ObservableObject {
             if !loggingEnabled { logger.flush() }
         }
     }
+    @Published var classificationEnabled: Bool {
+        didSet {
+            defaults.set(classificationEnabled, forKey: Keys.classification)
+            if !classificationEnabled { soundGuesses = [] }
+            if isRunning { restart() }
+        }
+    }
     @Published var preventSleep: Bool {
         didSet {
             defaults.set(preventSleep, forKey: Keys.preventSleep)
@@ -98,12 +115,16 @@ final class AudioMonitor: ObservableObject {
         static let sound = "soundEnabled"
         static let logging = "loggingEnabled"
         static let preventSleep = "preventSleep"
+        static let classification = "classificationEnabled"
     }
 
     private let defaults = UserDefaults.standard
     private let captureQueue = DispatchQueue(label: "VolumeChecker.capture")
     private var session: AVCaptureSession?
     private var receiver: AudioSampleReceiver?
+    private var classifier: SoundClassifier?
+    /// 辨識信心度低於這個值就當作「無法判斷」。
+    private let minConfidence = 0.3
     private var runtimeErrorObserver: NSObjectProtocol?
     private var watchdog: Timer?
     private var runStartedAt: Date?
@@ -138,6 +159,7 @@ final class AudioMonitor: ObservableObject {
             Keys.sound: false,
             Keys.logging: true,
             Keys.preventSleep: true,
+            Keys.classification: true,
         ])
         selectedDeviceUID = defaults.string(forKey: Keys.device) ?? ""
         threshold = defaults.double(forKey: Keys.threshold)
@@ -147,6 +169,7 @@ final class AudioMonitor: ObservableObject {
         soundEnabled = defaults.bool(forKey: Keys.sound)
         loggingEnabled = defaults.bool(forKey: Keys.logging)
         preventSleep = defaults.bool(forKey: Keys.preventSleep)
+        classificationEnabled = defaults.bool(forKey: Keys.classification)
 
         refreshDevices()
         AudioDeviceManager.observeDeviceChanges { [weak self] in
@@ -238,6 +261,8 @@ final class AudioMonitor: ObservableObject {
         isNoisy = false
         lastAlert = nil
         errorMessage = nil
+        soundGuesses = []
+        soundStats = [:]
     }
 
     func openLogFolder() {
@@ -289,11 +314,29 @@ final class AudioMonitor: ObservableObject {
         }
 
         let output = AVCaptureAudioDataOutput()
-        let receiver = AudioSampleReceiver { [weak self] dbfs in
-            DispatchQueue.main.async {
-                self?.process(dbfs: dbfs, at: Date())
-            }
+        var classifier: SoundClassifier?
+        if classificationEnabled {
+            classifier = SoundClassifier(
+                onResult: { [weak self] guesses in
+                    DispatchQueue.main.async { self?.handleClassification(guesses) }
+                },
+                onError: { [weak self] message in
+                    DispatchQueue.main.async { self?.errorMessage = message }
+                }
+            )
         }
+        var onBuffer: ((AVAudioPCMBuffer) -> Void)?
+        if let classifier {
+            onBuffer = { buffer in classifier.analyze(buffer) }
+        }
+        let receiver = AudioSampleReceiver(
+            onLevel: { [weak self] dbfs in
+                DispatchQueue.main.async {
+                    self?.process(dbfs: dbfs, at: Date())
+                }
+            },
+            onBuffer: onBuffer
+        )
         output.setSampleBufferDelegate(receiver, queue: captureQueue)
         guard session.canAddOutput(output) else {
             errorMessage = "無法建立音訊輸出。"
@@ -313,6 +356,7 @@ final class AudioMonitor: ObservableObject {
 
         self.session = session
         self.receiver = receiver
+        self.classifier = classifier
         captureQueue.async {
             session.startRunning()
         }
@@ -343,6 +387,9 @@ final class AudioMonitor: ObservableObject {
         }
         session = nil
         receiver = nil
+        classifier?.stop()
+        classifier = nil
+        soundGuesses = []
         endActivity()
         if loggingEnabled { logger.flush() }
         finishActiveEvent()
@@ -473,6 +520,28 @@ final class AudioMonitor: ObservableObject {
         }
     }
 
+    private func handleClassification(_ guesses: [SoundGuess]) {
+        guard isRunning, classificationEnabled else { return }
+        soundGuesses = guesses.filter { $0.confidence >= minConfidence }
+        guard let top = soundGuesses.first, !top.isSilence else { return }
+
+        soundStats[top.identifier, default: 0] += 1
+        if loggingEnabled { logger.addSound(top.identifier) }
+        if isNoisy, !events.isEmpty, events[0].isOngoing {
+            events[0].soundCounts[top.identifier, default: 0] += 1
+        }
+    }
+
+    /// 本次監控最常出現的聲音（名稱、百分比），由多到少。
+    var topSounds: [(name: String, percent: Double)] {
+        let total = soundStats.values.reduce(0, +)
+        guard total > 0 else { return [] }
+        return soundStats
+            .sorted { $0.value > $1.value }
+            .prefix(5)
+            .map { (name: SoundLabels.name(for: $0.key), percent: Double($0.value) / Double(total) * 100) }
+    }
+
     private func finishActiveEvent() {
         guard isNoisy else { return }
         isNoisy = false
@@ -496,17 +565,23 @@ final class AudioMonitor: ObservableObject {
             format: "目前音量 %.0f dB，已超過門檻 %.0f dB 達 %.0f 秒。",
             db, threshold, minDuration
         )
+        if let sound = soundGuesses.first, !sound.isSilence {
+            content.body += "可能是：\(sound.name)"
+        }
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
     }
 }
 
 /// 接收 AVCaptureSession 的音訊區塊，回報所有聲道平均的音量（dBFS，0 為數位滿刻度）。
+/// 若有 `onBuffer`，也會把音訊複製成 AVAudioPCMBuffer 交給聲音辨識。
 final class AudioSampleReceiver: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private let onLevel: (Double) -> Void
+    private let onBuffer: ((AVAudioPCMBuffer) -> Void)?
 
-    init(onLevel: @escaping (Double) -> Void) {
+    init(onLevel: @escaping (Double) -> Void, onBuffer: ((AVAudioPCMBuffer) -> Void)?) {
         self.onLevel = onLevel
+        self.onBuffer = onBuffer
     }
 
     func captureOutput(
@@ -524,5 +599,29 @@ final class AudioSampleReceiver: NSObject, AVCaptureAudioDataOutputSampleBufferD
         }
         energy /= Double(channels.count)
         onLevel(10 * log10(max(energy, 1e-12)))
+
+        if let onBuffer, let pcm = Self.makePCMBuffer(from: sampleBuffer) {
+            onBuffer(pcm)
+        }
+    }
+
+    private static func makePCMBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
+        guard let description = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbdPointer = CMAudioFormatDescriptionGetStreamBasicDescription(description)
+        else { return nil }
+        var asbd = asbdPointer.pointee
+        let frames = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard frames > 0,
+              let format = AVAudioFormat(streamDescription: &asbd),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames))
+        else { return nil }
+        buffer.frameLength = AVAudioFrameCount(frames)
+        let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sampleBuffer,
+            at: 0,
+            frameCount: Int32(frames),
+            into: buffer.mutableAudioBufferList
+        )
+        return status == noErr ? buffer : nil
     }
 }

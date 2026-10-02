@@ -56,6 +56,9 @@ struct MenuBarView: View {
         if monitor.isRunning {
             Text(String(format: "目前音量：%.0f dB（門檻 %.0f dB）", monitor.currentDB, monitor.threshold))
             Text(String(format: "平均 Leq：%.0f dB　最大：%.0f dB", monitor.sessionLeq, monitor.sessionMax))
+            if let sound = monitor.soundGuesses.first {
+                Text(String(format: "可能是：%@（%.0f%%）", sound.name, sound.confidence * 100))
+            }
         } else {
             Text("尚未開始監控")
         }
